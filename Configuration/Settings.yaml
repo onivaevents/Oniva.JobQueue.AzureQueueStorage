@@ -1,0 +1,19 @@
+#Flowpack:
+#  JobQueue:
+#    Common:
+#      queues:
+#        'azure-storage-queue':
+#          className: 'Oniva\JobQueue\AzureQueueStorage\Queue\AzureQueueStorage'
+#          maximumNumberOfReleases: 3
+#          executeIsolated: true
+#          options:
+#            defaultTimeout: 30 # Default timeout in seconds
+#            claimCheckThreshold: 32768 # Message size threshold for claim check pattern (in bytes)
+#            defaultTtl: 604800 # Default message TTL in seconds (7 days max for Azure Storage Queue)
+#            pollingInterval: 1000 # Polling interval in milliseconds
+#            connectionString: DefaultEndpointsProtocol=https;AccountName=myaccountname;AccountKey=myaccountkey;EndpointSuffix=core.windows.net
+#            blobContainer: jobqueue-blobs
+#            usePriorityQueue: true
+#            usePoisonQueue: true
+#            prioritySuffix: '-priority'
+#            poisonSuffix: '-poison'

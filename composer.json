@@ -1,0 +1,25 @@
+{
+    "description": "A Flowpack.JobQueue.Common implementation to support Azure Queue Storage as backend",
+    "type": "neos-package",
+    "name": "oniva/jobqueue-azurequeuestorage",
+    "require": {
+        "flowpack/jobqueue-common": "^3.0",
+        "microsoft/azure-storage-queue": "^1.3",
+        "microsoft/azure-storage-blob": "^1.5"
+    },
+    "autoload": {
+        "psr-4": {
+            "Oniva\\JobQueue\\AzureQueueStorage\\": "Classes/"
+        }
+    },
+    "extra": {
+        "neos": {
+            "package-key": "Oniva.JobQueue.AzureQueueStorage"
+        }
+    },
+    "config": {
+        "allow-plugins": {
+            "neos/composer-plugin": true
+        }
+    }
+}
