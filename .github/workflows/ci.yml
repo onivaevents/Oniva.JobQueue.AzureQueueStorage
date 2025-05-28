@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+
+env:
+  PHP_VERSION: 8.1
+  COMPOSER_VERSION: 2.8.9
+  
+jobs:
+  test:
+    name: PHP 8.1 - Test Suite
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache Composer packages
+        uses: actions/cache@v4
+        id: composer-cache
+        with:
+          path: /tmp/composer-cache
+          key: ${{ runner.os }}-${{ hashFiles('composer.lock') }}
+
+      - name: Validate composer.json and composer.lock
+        uses: php-actions/composer@v6
+        with:
+          php_version: ${{ env.PHP_VERSION }}
+          version: ${{ env.COMPOSER_VERSION }}
+          command: validate
+          args: --strict
+
+      - name: Install dependencies
+        uses: php-actions/composer@v6
+        with:
+          php_version: ${{ env.PHP_VERSION }}
+          version: ${{ env.COMPOSER_VERSION }}
+          command: install
+          args: --prefer-dist --no-progress
+
+      - name: Run linting
+        uses: php-actions/composer@v6
+        with:
+          php_version: ${{ env.PHP_VERSION }}
+          version: ${{ env.COMPOSER_VERSION }}
+          command: lint
+
+      - name: Run PHPStan
+        uses: php-actions/composer@v6
+        with:
+          php_version: ${{ env.PHP_VERSION }}
+          version: ${{ env.COMPOSER_VERSION }}
+          command: phpstan
+
+      - name: Run PHPUnit tests
+        uses: php-actions/composer@v6
+        with:
+          php_version: ${{ env.PHP_VERSION }}
+          version: ${{ env.COMPOSER_VERSION }}
+          command: phpunit

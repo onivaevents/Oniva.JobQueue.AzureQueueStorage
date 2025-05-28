@@ -7,7 +7,7 @@ namespace Oniva\JobQueue\AzureQueueStorage\Tests\Unit\Queue;
 use Neos\Flow\Tests\UnitTestCase;
 use Oniva\JobQueue\AzureQueueStorage\Queue\AzureQueueStorageMessage;
 
-class AzureQueueStorageMessageTest extends UnitTestCase
+class AzureStorageQueueMessageTest extends UnitTestCase
 {
     protected AzureQueueStorageMessage $obj;
 

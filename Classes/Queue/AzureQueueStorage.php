@@ -482,42 +482,39 @@ class AzureQueueStorage implements QueueInterface
         $peekMessageOptions = new PeekMessagesOptions();
         $peekMessageOptions->setNumberOfMessages($this->peekLimit);
 
+        $normalCount = 0;
+        $priorityCount = 0;
+
         try {
-            $normalCount = 0;
-            $priorityCount = 0;
+            $messages = $this->getQueueService()->peekMessages($this->normalPriorityQueueName, $peekMessageOptions);
+            $normalCount = count($messages->getQueueMessages());
+            // If we hit the peek limit, fall back to approximate count
+            if ($normalCount === $this->peekLimit) {
+                $normalQueueMetadata = $this->getQueueService()->getQueueMetadata($this->normalPriorityQueueName);
+                $normalCount = $normalQueueMetadata->getApproximateMessageCount();
+            }
 
+        } catch (Exception $e) {
+            // Ignore if queue doesn't exist
+        }
+
+        // Only count priority queue if priority queue feature is enabled
+        if ($this->usePriorityQueue) {
             try {
-                $messages = $this->getQueueService()->peekMessages($this->normalPriorityQueueName, $peekMessageOptions);
-                $normalCount = count($messages->getQueueMessages());
+                $messages = $this->getQueueService()->peekMessages($this->priorityQueueName, $peekMessageOptions);
+                $priorityCount = count($messages->getQueueMessages());
                 // If we hit the peek limit, fall back to approximate count
-                if ($normalCount === $this->peekLimit) {
-                    $normalQueueMetadata = $this->getQueueService()->getQueueMetadata($this->normalPriorityQueueName);
-                    $normalCount = $normalQueueMetadata->getApproximateMessageCount();
+                if ($priorityCount === $this->peekLimit) {
+                    $priorityQueueMetadata = $this->getQueueService()->getQueueMetadata($this->priorityQueueName);
+                    $priorityCount = $priorityQueueMetadata->getApproximateMessageCount();
                 }
-
             } catch (Exception $e) {
                 // Ignore if queue doesn't exist
             }
-
-            // Only count priority queue if priority queue feature is enabled
-            if ($this->usePriorityQueue) {
-                try {
-                    $messages = $this->getQueueService()->peekMessages($this->priorityQueueName, $peekMessageOptions);
-                    $priorityCount = count($messages->getQueueMessages());
-                    // If we hit the peek limit, fall back to approximate count
-                    if ($priorityCount === $this->peekLimit) {
-                        $priorityQueueMetadata = $this->getQueueService()->getQueueMetadata($this->priorityQueueName);
-                        $priorityCount = $priorityQueueMetadata->getApproximateMessageCount();
-                    }
-                } catch (Exception $e) {
-                    // Ignore if queue doesn't exist
-                }
-            }
-
-            return $normalCount + $priorityCount;
-        } catch (Exception $e) {
-            return 0;
         }
+
+        return $normalCount + $priorityCount;
+
     }
 
     /**
@@ -689,7 +686,9 @@ class AzureQueueStorage implements QueueInterface
             $listMessagesOptions = new ListMessagesOptions();
             $listMessagesOptions->setNumberOfMessages(1);
 
-            /** @var $queueMessages QueueMessage[] */
+            /**
+             * @var QueueMessage[] $queueMessages
+             */
             $queueMessages = [];
             $queueName = $this->normalPriorityQueueName;
 

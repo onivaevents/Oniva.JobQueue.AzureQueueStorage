@@ -1,0 +1,12 @@
+bin
+Build
+Data
+Packages
+vendor
+.DS_Store
+.idea/
+.phpcs-cache
+.php-cs-fixer.cache
+.phpunit.result.cache
+composer.lock
+report.xml

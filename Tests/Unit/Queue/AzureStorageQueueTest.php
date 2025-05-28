@@ -11,6 +11,7 @@ use MicrosoftAzure\Storage\Queue\Internal\IQueue;
 use MicrosoftAzure\Storage\Queue\Models\CreateMessageResult;
 use MicrosoftAzure\Storage\Queue\Models\GetQueueMetadataResult;
 use MicrosoftAzure\Storage\Queue\Models\ListMessagesResult;
+use MicrosoftAzure\Storage\Queue\Models\PeekMessagesOptions;
 use MicrosoftAzure\Storage\Queue\Models\PeekMessagesResult;
 use MicrosoftAzure\Storage\Queue\Models\QueueMessage;
 use Neos\Flow\Tests\UnitTestCase;
@@ -23,7 +24,7 @@ use Psr\Log\LoggerInterface;
 use Exception;
 use ReflectionClass;
 
-class AzureQueueStorageTest extends UnitTestCase
+class AzureStorageQueueTest extends UnitTestCase
 {
     protected AzureQueueStorage $obj;
     protected AzureStorageClientFactory&MockObject $clientFactory;
@@ -189,12 +190,15 @@ class AzureQueueStorageTest extends UnitTestCase
     {
         $queue = $this->createQueue('test-queue', ['usePriorityQueue' => true]);
 
-        $this->queueService->expects($this->exactly(2))
+        $matcher = $this->exactly(2);
+        $this->queueService->expects($matcher)
             ->method('createQueue')
-            ->withConsecutive(
-                ['test-queue'],
-                ['test-queue-priority']
-            );
+            ->willReturnCallback(function (string $queueName) use ($matcher) {
+                match ($matcher->numberOfInvocations()) {
+                    1 =>  $this->assertEquals($queueName, 'test-queue'),
+                    2 =>  $this->assertEquals($queueName, 'test-queue-priority'),
+                };
+            });
 
         $queue->setUp();
     }
@@ -682,11 +686,13 @@ class AzureQueueStorageTest extends UnitTestCase
 
         $this->queueService->expects($this->exactly(2))
             ->method('peekMessages')
-            ->withConsecutive(
-                ['test-queue-priority', $this->anything()],
-                ['test-queue', $this->anything()]
-            )
-            ->willReturnOnConsecutiveCalls($highPriorityResult, $normalResult);
+            ->willReturnCallback(
+                fn (string $queueName, PeekMessagesOptions $options) =>
+                match ($queueName) {
+                    'test-queue-priority' => $highPriorityResult,
+                    'test-queue' => $normalResult,
+                }
+            );
 
         $messages = $queue->peek(2);
 
@@ -744,19 +750,23 @@ class AzureQueueStorageTest extends UnitTestCase
 
         $this->queueService->expects($this->exactly(2))
             ->method('peekMessages')
-            ->withConsecutive(
-                ['test-queue'],
-                ['test-queue-priority']
-            )
-            ->willReturnOnConsecutiveCalls($normalMessages, $priorityMessages);
+        ->willReturnCallback(
+            fn ($queueName) =>
+    match($queueName) {
+        'test-queue-priority' => $priorityMessages,
+        'test-queue' => $normalMessages
+    }
+        );
 
         $this->queueService->expects($this->exactly(2))
             ->method('getQueueMetadata')
-            ->withConsecutive(
-                ['test-queue'],
-                ['test-queue-priority']
-            )
-            ->willReturnOnConsecutiveCalls($normalMetadata, $priorityMetadata);
+        ->willReturnCallback(
+            fn ($queueName) =>
+    match($queueName) {
+        'test-queue-priority' => $priorityMetadata,
+        'test-queue' => $normalMetadata
+    }
+        );
 
         $count = $queue->countReady();
 
@@ -848,12 +858,15 @@ class AzureQueueStorageTest extends UnitTestCase
     {
         $queue = $this->createQueue('test-queue', ['usePriorityQueue' => true]);
 
-        $this->queueService->expects($this->exactly(2))
+        $matcher = $this->exactly(2);
+        $this->queueService->expects($matcher)
             ->method('clearMessages')
-            ->withConsecutive(
-                ['test-queue'],
-                ['test-queue-priority']
-            );
+        ->willReturnCallback(function (string $queueName) use ($matcher) {
+            match ($matcher->numberOfInvocations()) {
+                1 =>  $this->assertEquals($queueName, 'test-queue'),
+                2 =>  $this->assertEquals($queueName, 'test-queue-priority'),
+            };
+        });
 
         $listBlobsResult = $this->createMock(ListBlobsResult::class);
         $listBlobsResult->method('getBlobs')->willReturn([]);
@@ -872,12 +885,15 @@ class AzureQueueStorageTest extends UnitTestCase
     {
         $queue = $this->createQueue('test-queue', ['usePoisonQueue' => true]);
 
-        $this->queueService->expects($this->exactly(2))
+        $matcher = $this->exactly(2);
+        $this->queueService->expects($matcher)
             ->method('clearMessages')
-            ->withConsecutive(
-                ['test-queue'],
-                ['test-queue-poison']
-            );
+            ->willReturnCallback(function (string $queueName) use ($matcher) {
+                match ($matcher->numberOfInvocations()) {
+                    1 =>  $this->assertEquals($queueName, 'test-queue'),
+                    2 =>  $this->assertEquals($queueName, 'test-queue-poison'),
+                };
+            });
 
         $listBlobsResult = $this->createMock(ListBlobsResult::class);
         $listBlobsResult->method('getBlobs')->willReturn([]);
