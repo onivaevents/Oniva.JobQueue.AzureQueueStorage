@@ -101,6 +101,11 @@ class AzureQueueStorage implements QueueInterface
     protected string $poisonSuffix = '-poison';
 
     /**
+     * Whether to preserve original payload in poison queue (if false, only metadata will be stored)
+     */
+    protected bool $preservePoisonPayload = false;
+
+    /**
      * @Flow\Inject
      * @var AzureStorageClientFactory
      */
@@ -149,6 +154,9 @@ class AzureQueueStorage implements QueueInterface
         if (isset($options['poisonSuffix'])) {
             $this->validateQueueSuffix($options['poisonSuffix']);
             $this->poisonSuffix = $options['poisonSuffix'];
+        }
+        if (isset($options['preservePoisonPayload'])) {
+            $this->preservePoisonPayload = (bool)$options['preservePoisonPayload'];
         }
 
         $this->normalPriorityQueueName = $name;
@@ -327,6 +335,7 @@ class AzureQueueStorage implements QueueInterface
             'popReceipt' => $message->getPopReceipt(),
             'blobName' => $message->getBlobName(),
             'queueName' => $message->getQueueName(),
+            'payload' => $message->getPayload(),
         ];
 
         return $message;
@@ -356,6 +365,13 @@ class AzureQueueStorage implements QueueInterface
 
             unset($this->reservedMessages[$messageId]);
         } catch (Exception $e) {
+            if ($e->getCode() === 404) {
+                $this->systemLogger->warning('Message no longer available during release(), likely taken by another worker', [
+                    'messageId' => $messageId,
+                ]);
+                unset($this->reservedMessages[$messageId]);
+                return;
+            }
             throw new JobQueueException('Failed to release message: ' . $e->getMessage(), 1234567897);
         }
     }
@@ -373,35 +389,63 @@ class AzureQueueStorage implements QueueInterface
 
         try {
             // Push a failed record to the poison queue
-            if ($this->usePoisonQueue) {
-                $failedPayload = json_encode([
+            $isProcessingPoisonQueue = $messageInfo['queueName'] === $this->poisonQueueName;
+            if ($this->usePoisonQueue && !$isProcessingPoisonQueue) {
+                $poisonPayload = [
                     'messageId' => $messageId,
                     'queueMessageId' => $messageInfo['queueMessageId'],
                     'originalQueue' => $messageInfo['queueName'],
-                    'blobName' => $messageInfo['blobName'] ?? null,
-                    'timestamp' => time(),
-                ]);
-                $this->getQueueService()->createMessage($this->poisonQueueName, $failedPayload);
+                    'timestamp'     => time(),
+                ];
+                if ($this->preservePoisonPayload) {
+                    $poisonPayload['payload'] = $messageInfo['payload'];
+                    $serialized = json_encode($poisonPayload);
+
+                    if (strlen($serialized) > $this->claimCheckThreshold) {
+                        unset($poisonPayload['payload']);
+                        $poisonBlobName = $this->generateBlobName('poison-' . $messageId);
+                        $this->getBlobService()->createBlockBlob(
+                            $this->containerName,
+                            $poisonBlobName,
+                            json_encode($messageInfo['payload'])
+                        );
+                        $poisonPayload['blobName'] = $poisonBlobName;
+                        $poisonPayload['isClaimCheck'] = true;
+                    }
+                }
+                $this->getQueueService()->createMessage($this->poisonQueueName, json_encode($poisonPayload));
             }
 
-            // Delete the message from original queue
-            $this->getQueueService()->deleteMessage(
-                $messageInfo['queueName'],
-                $messageInfo['queueMessageId'],
-                $messageInfo['popReceipt']
-            );
+            if (!$isProcessingPoisonQueue) {
+                // Delete the message from original queue
+                $this->getQueueService()->deleteMessage(
+                    $messageInfo['queueName'],
+                    $messageInfo['queueMessageId'],
+                    $messageInfo['popReceipt']
+                );
 
-            // Clean up blob if it exists
-            if (!empty($messageInfo['blobName'])) {
-                try {
-                    $this->getBlobService()->deleteBlob($this->containerName, $messageInfo['blobName']);
-                } catch (Exception $e) {
-                    // Log but don't throw - message is already aborted
+                // Clean up blob if it exists
+                if (!empty($messageInfo['blobName'])) {
+                    try {
+                        $this->getBlobService()->deleteBlob($this->containerName, $messageInfo['blobName']);
+                    } catch (Exception $e) {
+                        $this->systemLogger->warning('Failed to delete blob after message abort', [
+                            'blobName' => $messageInfo['blobName'],
+                            'error'    => $e->getMessage(),
+                        ]);
+                    }
                 }
             }
 
             unset($this->reservedMessages[$messageId]);
         } catch (Exception $e) {
+            if ($e->getCode() === 404) {
+                $this->systemLogger->warning('Message no longer available during abort(), likely taken by another worker', [
+                    'messageId' => $messageId,
+                ]);
+                unset($this->reservedMessages[$messageId]);
+                return;
+            }
             throw new JobQueueException('Failed to abort message: ' . $e->getMessage(), 1234567899);
         }
     }
@@ -431,13 +475,23 @@ class AzureQueueStorage implements QueueInterface
                 try {
                     $this->getBlobService()->deleteBlob($this->containerName, $messageInfo['blobName']);
                 } catch (Exception $e) {
-                    // Log but don't throw - message is already finished
+                    $this->systemLogger->warning('Failed to delete blob after message finish', [
+                        'blobName' => $messageInfo['blobName'],
+                        'error'    => $e->getMessage(),
+                    ]);
                 }
             }
 
             unset($this->reservedMessages[$messageId]);
             return true;
         } catch (Exception $e) {
+            if ($e->getCode() === 404) {
+                $this->systemLogger->info('Message already deleted by another worker during finish', [
+                    'messageId' => $messageId,
+                ]);
+                unset($this->reservedMessages[$messageId]);
+                return true;
+            }
             throw new JobQueueException('Failed to finish message: ' . $e->getMessage(), 1234567900);
         }
     }
@@ -569,7 +623,7 @@ class AzureQueueStorage implements QueueInterface
                 $this->getQueueService()->clearMessages($this->priorityQueueName);
             }
 
-            // Clear poison queue only if priority queue feature is enabled
+            // Clear poison queue only if poison queue feature is enabled
             if ($this->usePoisonQueue) {
                 $this->getQueueService()->clearMessages($this->poisonQueueName);
             }
@@ -781,6 +835,8 @@ class AzureQueueStorage implements QueueInterface
                     throw new JobQueueException('Invalid JSON in blob: ' . json_last_error_msg(), 1234567912);
                 }
                 return $payload;
+            } catch (JobQueueException $e) {
+                throw $e;
             } catch (Exception $e) {
                 throw new JobQueueException('Failed to retrieve claim check blob: ' . $e->getMessage(), 1234567904);
             }

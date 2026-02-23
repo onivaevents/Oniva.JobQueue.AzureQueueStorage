@@ -24,7 +24,7 @@ Flowpack:
   JobQueue:
     Common:
       queues:
-        'my-azure-storage-queuee':
+        'my-azure-storage-queue':
           className: 'Oniva\JobQueue\AzureQueueStorage\Queue\AzureQueueStorage'
           options:
             connectionString: DefaultEndpointsProtocol=https;AccountName=myaccountname;AccountKey=myaccountkey;EndpointSuffix=core.windows.net
@@ -50,6 +50,7 @@ Flowpack:
             blobContainer: jobqueue-blobs # Blob container name for claim check messages
             usePriorityQueue: true # Enable priority queueing
             usePoisonQueue: true # Enable poison queue for failed jobs
+            preservePoisonPayload: true # Preserve the original payload for failed jobs in the poison queue
             prioritySuffix: '-priority' # Suffix for priority queue
             poisonSuffix: '-poison' # Suffix for poison queue
 ```
@@ -62,9 +63,26 @@ This allows you to submit high-priority jobs that will be processed before regul
 $queue->submit($payload, ['priority' => true]);
 ```
 
+## Poison Queue
+
+To enable the poison queue, set `usePoisonQueue` to `true`. Failed jobs (those that exceed
+`maximumNumberOfReleases`) are automatically moved to a dead-letter queue for inspection.
+
+By default, only metadata is stored in the poison queue. To preserve the original payload for
+retry or debugging, also set `preservePoisonPayload: true`.
+
+To retry failed jobs, run a worker directly against the poison queue:
+```bash
+./flow flowpack.jobqueue.common:job:work my-azure-storage-queue-poison
+```
+
+Note: jobs being processed from the poison queue will not be re-poisoned on failure — they
+are left visible in the queue for manual inspection instead.
+
 ## Caveats
 * 7-day message limit - Azure Queue Storage automatically deletes messages after 7 days maximum, even if unprocessed
 * 64KB queue message size - While the claim check pattern handles larger payloads, it adds latency and blob storage costs
 * No native queue priorities - Priority queues are simulated by polling multiple queues, which increases API calls
 * Approximate counts only - Queue metrics like countReady() are estimates, not exact counts, due to Azure's distributed nature
 * No message ordering guarantee - Azure Queue Storage doesn't guarantee FIFO ordering, messages may be processed out of sequence
+* Poison queue retry is manual - Failed jobs are moved to a dead-letter queue but not automatically retried.
