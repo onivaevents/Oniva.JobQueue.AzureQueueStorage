@@ -10,6 +10,7 @@ use MicrosoftAzure\Storage\Blob\Models\ListBlobsResult;
 use MicrosoftAzure\Storage\Queue\Internal\IQueue;
 use MicrosoftAzure\Storage\Queue\Models\CreateMessageResult;
 use MicrosoftAzure\Storage\Queue\Models\GetQueueMetadataResult;
+use MicrosoftAzure\Storage\Queue\Models\ListMessagesOptions;
 use MicrosoftAzure\Storage\Queue\Models\ListMessagesResult;
 use MicrosoftAzure\Storage\Queue\Models\PeekMessagesOptions;
 use MicrosoftAzure\Storage\Queue\Models\PeekMessagesResult;
@@ -943,6 +944,29 @@ class AzureStorageQueueTest extends UnitTestCase
         $queueMessage->method('getDequeueCount')->willReturn(1);
 
         return $queueMessage;
+    }
+
+    /**
+     * @test
+     */
+    public function dequeueSetsVisibilityTimeout(): void
+    {
+        $queue = $this->createQueue('test-queue', ['visibilityTimeout' => 120]);
+
+        $listResult = $this->createMock(ListMessagesResult::class);
+        $listResult->method('getQueueMessages')->willReturn([]);
+
+        $this->queueService->expects($this->once())
+            ->method('listMessages')
+            ->with(
+                'test-queue',
+                $this->callback(function (ListMessagesOptions $options) {
+                    return $options->getVisibilityTimeoutInSeconds() === 120;
+                })
+            )
+            ->willReturn($listResult);
+
+        $queue->waitAndReserve(0);
     }
 
     /**
