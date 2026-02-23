@@ -2,6 +2,7 @@
 
 namespace Oniva\JobQueue\AzureQueueStorage\Command;
 
+use Flowpack\JobQueue\Common\Queue\QueueInterface;
 use Neos\Flow\Annotations as Flow;
 use Flowpack\JobQueue\Common\Queue\QueueManager;
 use Neos\Flow\Cli\CommandController;
@@ -120,7 +121,7 @@ class RetryQueueCommandController extends CommandController
         $this->output->outputTable($rows, ['Message ID', 'Queue Message ID', 'Blob Name', 'Releases', 'Payload']);
     }
 
-    private function getQueue(string $queue): RetryableQueueInterface
+    private function getQueue(string $queue): RetryableQueueInterface&QueueInterface
     {
         $queueInstance = $this->queueManager->getQueue($queue);
         if (!$queueInstance instanceof RetryableQueueInterface) {
