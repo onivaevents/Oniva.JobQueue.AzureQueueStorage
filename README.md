@@ -42,7 +42,8 @@ Flowpack:
           executeIsolated: true
           options:
             connectionString: DefaultEndpointsProtocol=https;AccountName=myaccountname;AccountKey=myaccountkey;EndpointSuffix=core.windows.net
-            defaultTimeout: 30 # Default timeout in seconds
+            defaultTimeout: 30 # Default polling timeout in seconds (how long to wait for a message)
+            visibilityTimeout: 300 # Default visibility timeout in seconds (how long message stays hidden during processing), note that this must exceed the maximum expected job duration
             claimCheckThreshold: 32768 # Message size threshold for claim check pattern (in bytes)
             defaultTtl: 604800 # Default message TTL in seconds (7 days max for Azure Storage Queue)
             pollingInterval: 1000 # Polling interval in milliseconds
