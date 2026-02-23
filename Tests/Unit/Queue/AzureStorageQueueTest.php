@@ -480,8 +480,8 @@ class AzureStorageQueueTest extends UnitTestCase
         $this->logger->expects($this->once())
             ->method('warning')
             ->with(
-                'Failed to delete blob after message take',
-                ['error' => 'Failed to delete blob']
+                'Failed to delete blob',
+                ['error' => 'Failed to delete blob', 'blobName' => 'test-blob']
             );
 
         $message = $queue->waitAndTake();
@@ -1131,6 +1131,617 @@ class AzureStorageQueueTest extends UnitTestCase
             ->willReturn($listResult);
 
         $queue->waitAndReserve(0);
+    }
+
+    /**
+     * @test
+     */
+    public function peekFailedReturnsEmptyArrayWhenPoisonQueueDisabled(): void
+    {
+        $queue = $this->createQueue();
+
+        $this->queueService->expects($this->never())->method('peekMessages');
+
+        $result = $queue->peekFailed(5);
+
+        $this->assertSame([], $result);
+    }
+
+    /**
+     * @test
+     */
+    public function peekFailedReturnsPoisonMessages(): void
+    {
+        $queue = $this->createQueue('test-queue', ['usePoisonQueue' => true]);
+
+        $envelope = [
+            'messageId'    => 'msg_123',
+            'originalQueue' => 'test-queue',
+            'timestamp'    => time(),
+        ];
+        $queueMessage = $this->createMock(QueueMessage::class);
+        $queueMessage->method('getMessageText')->willReturn(json_encode($envelope));
+        $queueMessage->method('getMessageId')->willReturn('azure-msg-id');
+        $queueMessage->method('getPopReceipt')->willReturn(null);
+        $queueMessage->method('getDequeueCount')->willReturn(0);
+
+        $peekResult = $this->createMock(PeekMessagesResult::class);
+        $peekResult->method('getQueueMessages')->willReturn([$queueMessage]);
+
+        $this->queueService->expects($this->once())
+            ->method('peekMessages')
+            ->with('test-queue-poison', $this->callback(function (PeekMessagesOptions $o) {
+                return $o->getNumberOfMessages() === 1;
+            }))
+            ->willReturn($peekResult);
+
+        $messages = $queue->peekFailed(1);
+
+        $this->assertCount(1, $messages);
+        $this->assertInstanceOf(AzureQueueStorageMessage::class, $messages[0]);
+        // Poison envelope should be the payload
+        $payload = $messages[0]->getPayload();
+        $this->assertEquals('test-queue', $payload['originalQueue']);
+    }
+
+    /**
+     * @test
+     */
+    public function peekFailedRespectsLimit(): void
+    {
+        $queue = $this->createQueue('test-queue', ['usePoisonQueue' => true]);
+
+        $peekResult = $this->createMock(PeekMessagesResult::class);
+        $peekResult->method('getQueueMessages')->willReturn([]);
+
+        $this->queueService->expects($this->once())
+            ->method('peekMessages')
+            ->with('test-queue-poison', $this->callback(function (PeekMessagesOptions $o) {
+                return $o->getNumberOfMessages() === 10;
+            }))
+            ->willReturn($peekResult);
+
+        $queue->peekFailed(10);
+    }
+
+    /**
+     * @test
+     */
+    public function peekFailedCapsAtPeekLimit(): void
+    {
+        $queue = $this->createQueue('test-queue', ['usePoisonQueue' => true]);
+
+        $peekResult = $this->createMock(PeekMessagesResult::class);
+        $peekResult->method('getQueueMessages')->willReturn([]);
+
+        $this->queueService->expects($this->once())
+            ->method('peekMessages')
+            ->with('test-queue-poison', $this->callback(function (PeekMessagesOptions $o) {
+                return $o->getNumberOfMessages() === 32; // peekLimit
+            }))
+            ->willReturn($peekResult);
+
+        $queue->peekFailed(100); // request more than peekLimit
+    }
+
+    /**
+     * @test
+     */
+    public function peekFailedReturnsEmptyWhenPoisonQueueDoesNotExist(): void
+    {
+        $queue = $this->createQueue('test-queue', ['usePoisonQueue' => true]);
+
+        $this->queueService->expects($this->once())
+            ->method('peekMessages')
+            ->willThrowException(new Exception('Queue not found', 404));
+
+        $result = $queue->peekFailed(5);
+
+        $this->assertSame([], $result);
+    }
+
+    /**
+     * @test
+     */
+    public function peekFailedThrowsOnUnexpectedError(): void
+    {
+        $queue = $this->createQueue('test-queue', ['usePoisonQueue' => true]);
+
+        $this->queueService->expects($this->once())
+            ->method('peekMessages')
+            ->willThrowException(new Exception('Service unavailable', 503));
+
+        $this->expectException(JobQueueException::class);
+        $this->expectExceptionCode(1234567930);
+
+        $queue->peekFailed(1);
+    }
+
+    /**
+     * @test
+     */
+    public function peekFailedResolvesClaimCheckBlobForPoisonMessage(): void
+    {
+        $queue = $this->createQueue('test-queue', [
+            'usePoisonQueue'        => true,
+            'preservePoisonPayload' => true,
+        ]);
+
+        $envelope = [
+            'messageId'    => 'msg_123',
+            'originalQueue' => 'test-queue',
+            'timestamp'    => time(),
+            'isClaimCheck' => true,
+            'blobName'     => 'poison-blob',
+        ];
+        $queueMessage = $this->createMock(QueueMessage::class);
+        $queueMessage->method('getMessageText')->willReturn(json_encode($envelope));
+        $queueMessage->method('getMessageId')->willReturn('azure-msg-id');
+        $queueMessage->method('getPopReceipt')->willReturn(null);
+        $queueMessage->method('getDequeueCount')->willReturn(0);
+
+        $peekResult = $this->createMock(PeekMessagesResult::class);
+        $peekResult->method('getQueueMessages')->willReturn([$queueMessage]);
+
+        $this->queueService->expects($this->once())
+            ->method('peekMessages')
+            ->willReturn($peekResult);
+
+        $stream = fopen('php://memory', 'r+');
+        fwrite($stream, json_encode(['original' => 'payload']));
+        rewind($stream);
+
+        $blobResult = $this->createMock(GetBlobResult::class);
+        $blobResult->method('getContentStream')->willReturn($stream);
+
+        $this->blobService->expects($this->once())
+            ->method('getBlob')
+            ->with('jobqueue-blobs', 'poison-blob')
+            ->willReturn($blobResult);
+
+        $messages = $queue->peekFailed(1);
+
+        $this->assertCount(1, $messages);
+        $payload = $messages[0]->getPayload();
+        $this->assertEquals(['original' => 'payload'], $payload['payload']);
+        $this->assertArrayNotHasKey('isClaimCheck', $payload);
+    }
+
+    /**
+     * @test
+     */
+    public function retryAllFailedReturnsZeroWhenPoisonQueueDisabled(): void
+    {
+        $queue = $this->createQueue();
+
+        $this->queueService->expects($this->never())->method('listMessages');
+
+        $count = $queue->retryAllFailed();
+
+        $this->assertSame(0, $count);
+    }
+
+    /**
+     * @test
+     */
+    public function retryAllFailedReturnsZeroWhenPoisonQueueEmpty(): void
+    {
+        $queue = $this->createQueue('test-queue', ['usePoisonQueue' => true]);
+
+        $emptyResult = $this->createMock(ListMessagesResult::class);
+        $emptyResult->method('getQueueMessages')->willReturn([]);
+
+        $this->queueService->expects($this->once())
+            ->method('listMessages')
+            ->with('test-queue-poison', $this->anything())
+            ->willReturn($emptyResult);
+
+        $count = $queue->retryAllFailed();
+
+        $this->assertSame(0, $count);
+    }
+
+    /**
+     * @test
+     */
+    public function retryAllFailedRequeuesMessageToOriginalQueue(): void
+    {
+        $queue = $this->createQueue('test-queue', [
+            'usePoisonQueue'        => true,
+            'preservePoisonPayload' => true,
+        ]);
+
+        $envelope = [
+            'messageId'    => 'msg_123',
+            'originalQueue' => 'test-queue',
+            'timestamp'    => time(),
+            'payload'      => ['retry' => 'me'],
+        ];
+
+        $queueMessage = $this->createMockQueueMessage(json_encode($envelope), 'azure-msg-id', 'pop-receipt');
+
+        $listResult = $this->createMock(ListMessagesResult::class);
+        $emptyResult = $this->createMock(ListMessagesResult::class);
+        $emptyResult->method('getQueueMessages')->willReturn([]);
+
+        $this->queueService->expects($this->exactly(2))
+            ->method('listMessages')
+            ->willReturnOnConsecutiveCalls($listResult, $emptyResult);
+
+        $listResult->method('getQueueMessages')->willReturn([$queueMessage]);
+
+        // Should requeue to original queue
+        $this->queueService->expects($this->once())
+            ->method('createMessage')
+            ->with(
+                'test-queue',
+                $this->callback(function ($content) {
+                    $data = json_decode($content, true);
+                    return isset($data['messageId'])
+                        && isset($data['payload'])
+                        && $data['payload'] === ['retry' => 'me'];
+                }),
+                $this->anything()
+            );
+
+        // Should delete from poison queue
+        $this->queueService->expects($this->once())
+            ->method('deleteMessage')
+            ->with('test-queue-poison', 'azure-msg-id', 'pop-receipt');
+
+        $count = $queue->retryAllFailed();
+
+        $this->assertSame(1, $count);
+    }
+
+    /**
+     * @test
+     */
+    public function retryAllFailedRequeuesMultipleMessages(): void
+    {
+        $queue = $this->createQueue('test-queue', [
+            'usePoisonQueue'        => true,
+            'preservePoisonPayload' => true,
+        ]);
+
+        $makeEnvelope = fn (int $i) => json_encode([
+            'messageId'    => "msg_$i",
+            'originalQueue' => 'test-queue',
+            'timestamp'    => time(),
+            'payload'      => ['index' => $i],
+        ]);
+
+        $msg1 = $this->createMockQueueMessage($makeEnvelope(1), 'azure-id-1', 'receipt-1');
+        $msg2 = $this->createMockQueueMessage($makeEnvelope(2), 'azure-id-2', 'receipt-2');
+
+        $result1 = $this->createMock(ListMessagesResult::class);
+        $result1->method('getQueueMessages')->willReturn([$msg1]);
+
+        $result2 = $this->createMock(ListMessagesResult::class);
+        $result2->method('getQueueMessages')->willReturn([$msg2]);
+
+        $emptyResult = $this->createMock(ListMessagesResult::class);
+        $emptyResult->method('getQueueMessages')->willReturn([]);
+
+        $this->queueService->expects($this->exactly(3))
+            ->method('listMessages')
+            ->willReturnOnConsecutiveCalls($result1, $result2, $emptyResult);
+
+        $this->queueService->expects($this->exactly(2))->method('createMessage');
+        $this->queueService->expects($this->exactly(2))->method('deleteMessage');
+
+        $count = $queue->retryAllFailed();
+
+        $this->assertSame(2, $count);
+    }
+
+    /**
+     * @test
+     */
+    public function retryAllFailedReturnsZeroWhenPoisonQueueDoesNotExist(): void
+    {
+        $queue = $this->createQueue('test-queue', ['usePoisonQueue' => true]);
+
+        $this->queueService->expects($this->once())
+            ->method('listMessages')
+            ->willThrowException(new Exception('Queue not found', 404));
+
+        $count = $queue->retryAllFailed();
+
+        $this->assertSame(0, $count);
+    }
+
+    /**
+     * @test
+     */
+    public function retryAllFailedThrowsAndReleasesOnRequeueError(): void
+    {
+        $queue = $this->createQueue('test-queue', [
+            'usePoisonQueue'        => true,
+            'preservePoisonPayload' => true,
+        ]);
+
+        $envelope = [
+            'messageId'     => 'msg_123',
+            'originalQueue' => 'test-queue',
+            'timestamp'     => time(),
+            'payload'       => ['data' => 'x'],
+        ];
+
+        $queueMessage = $this->createMockQueueMessage(json_encode($envelope), 'azure-msg-id', 'pop-receipt');
+
+        $listResult = $this->createMock(ListMessagesResult::class);
+        $listResult->method('getQueueMessages')->willReturn([$queueMessage]);
+
+        $this->queueService->expects($this->once())
+            ->method('listMessages')
+            ->willReturn($listResult);
+
+        // createMessage (requeue) fails
+        $this->queueService->expects($this->once())
+            ->method('createMessage')
+            ->willThrowException(new Exception('Service error', 500));
+
+        // Should try to release the poison message back
+        $this->queueService->expects($this->once())
+            ->method('updateMessage')
+            ->with('test-queue-poison', 'azure-msg-id', 'pop-receipt', '', 0);
+
+        $this->expectException(JobQueueException::class);
+        $this->expectExceptionCode(1234567932);
+
+        $queue->retryAllFailed();
+    }
+
+    /**
+     * @test
+     */
+    public function retryAllFailedLogsErrorWhenReleaseAlsoFails(): void
+    {
+        $queue = $this->createQueue('test-queue', [
+            'usePoisonQueue'        => true,
+            'preservePoisonPayload' => true,
+        ]);
+
+        $envelope = [
+            'messageId'     => 'msg_123',
+            'originalQueue' => 'test-queue',
+            'timestamp'     => time(),
+            'payload'       => ['data' => 'x'],
+        ];
+
+        $queueMessage = $this->createMockQueueMessage(json_encode($envelope), 'azure-msg-id', 'pop-receipt');
+
+        $listResult = $this->createMock(ListMessagesResult::class);
+        $listResult->method('getQueueMessages')->willReturn([$queueMessage]);
+
+        $this->queueService->method('listMessages')->willReturn($listResult);
+        $this->queueService->method('createMessage')
+            ->willThrowException(new Exception('Service error', 500));
+        $this->queueService->method('updateMessage')
+            ->willThrowException(new Exception('Also failed', 500));
+
+        $this->logger->expects($this->once())
+            ->method('error')
+            ->with('Failed to release poison message after retry error', $this->arrayHasKey('messageId'));
+
+        $this->expectException(JobQueueException::class);
+
+        $queue->retryAllFailed();
+    }
+
+    /**
+     * @test
+     */
+    public function retryAllFailedWithDelayPassesDelayOption(): void
+    {
+        $queue = $this->createQueue('test-queue', [
+            'usePoisonQueue'        => true,
+            'preservePoisonPayload' => true,
+        ]);
+
+        $envelope = [
+            'messageId'     => 'msg_123',
+            'originalQueue' => 'test-queue',
+            'timestamp'     => time(),
+            'payload'       => ['data' => 'x'],
+        ];
+
+        $queueMessage = $this->createMockQueueMessage(json_encode($envelope), 'azure-msg-id', 'pop-receipt');
+
+        $listResult = $this->createMock(ListMessagesResult::class);
+        $emptyResult = $this->createMock(ListMessagesResult::class);
+        $listResult->method('getQueueMessages')->willReturn([$queueMessage]);
+        $emptyResult->method('getQueueMessages')->willReturn([]);
+
+        $this->queueService->expects($this->exactly(2))
+            ->method('listMessages')
+            ->willReturnOnConsecutiveCalls($listResult, $emptyResult);
+
+        $this->queueService->expects($this->once())
+            ->method('createMessage')
+            ->with(
+                'test-queue',
+                $this->anything(),
+                $this->callback(function ($options) {
+                    return $options->getVisibilityTimeoutInSeconds() === 60;
+                })
+            );
+
+        $this->queueService->method('deleteMessage');
+
+        $queue->retryAllFailed(['delay' => 60]);
+    }
+
+    /**
+     * @test
+     */
+    public function discardAllFailedReturnsZeroWhenPoisonQueueDisabled(): void
+    {
+        $queue = $this->createQueue();
+
+        $this->queueService->expects($this->never())->method('listMessages');
+
+        $count = $queue->discardAllFailed();
+
+        $this->assertSame(0, $count);
+    }
+
+    /**
+     * @test
+     */
+    public function discardAllFailedReturnsZeroWhenPoisonQueueEmpty(): void
+    {
+        $queue = $this->createQueue('test-queue', ['usePoisonQueue' => true]);
+
+        $emptyResult = $this->createMock(ListMessagesResult::class);
+        $emptyResult->method('getQueueMessages')->willReturn([]);
+
+        $this->queueService->expects($this->once())
+            ->method('listMessages')
+            ->with('test-queue-poison', $this->anything())
+            ->willReturn($emptyResult);
+
+        $count = $queue->discardAllFailed();
+
+        $this->assertSame(0, $count);
+    }
+
+    /**
+     * @test
+     */
+    public function discardAllFailedDeletesMessagesAndBlobs(): void
+    {
+        $queue = $this->createQueue('test-queue', ['usePoisonQueue' => true]);
+
+        $envelope = json_encode([
+            'messageId'    => 'msg_123',
+            'originalQueue' => 'test-queue',
+            'timestamp'    => time(),
+            'isClaimCheck' => true,
+            'blobName'     => 'poison-blob',
+        ]);
+
+        $queueMessage = $this->createMockQueueMessage($envelope, 'azure-msg-id', 'pop-receipt');
+
+        $listResult = $this->createMock(ListMessagesResult::class);
+        $emptyResult = $this->createMock(ListMessagesResult::class);
+        $listResult->method('getQueueMessages')->willReturn([$queueMessage]);
+        $emptyResult->method('getQueueMessages')->willReturn([]);
+
+        $this->queueService->expects($this->exactly(2))
+            ->method('listMessages')
+            ->willReturnOnConsecutiveCalls($listResult, $emptyResult);
+
+        $this->blobService->expects($this->once())
+            ->method('deleteBlob')
+            ->with('jobqueue-blobs', 'poison-blob');
+
+        $this->queueService->expects($this->once())
+            ->method('deleteMessage')
+            ->with('test-queue-poison', 'azure-msg-id', 'pop-receipt');
+
+        $count = $queue->discardAllFailed();
+
+        $this->assertSame(1, $count);
+    }
+
+    /**
+     * @test
+     */
+    public function discardAllFailedDeletesMultipleMessages(): void
+    {
+        $queue = $this->createQueue('test-queue', ['usePoisonQueue' => true]);
+
+        $makeMsg = fn (int $i) => $this->createMockQueueMessage(
+            json_encode(['messageId' => "msg_$i", 'originalQueue' => 'test-queue', 'timestamp' => time()]),
+            "azure-id-$i",
+            "receipt-$i"
+        );
+
+        $result1 = $this->createMock(ListMessagesResult::class);
+        $result1->method('getQueueMessages')->willReturn([$makeMsg(1)]);
+
+        $result2 = $this->createMock(ListMessagesResult::class);
+        $result2->method('getQueueMessages')->willReturn([$makeMsg(2)]);
+
+        $emptyResult = $this->createMock(ListMessagesResult::class);
+        $emptyResult->method('getQueueMessages')->willReturn([]);
+
+        $this->queueService->expects($this->exactly(3))
+            ->method('listMessages')
+            ->willReturnOnConsecutiveCalls($result1, $result2, $emptyResult);
+
+        $this->queueService->expects($this->exactly(2))->method('deleteMessage');
+
+        $count = $queue->discardAllFailed();
+
+        $this->assertSame(2, $count);
+    }
+
+    /**
+     * @test
+     */
+    public function discardAllFailedSkipsBlobDeletionWhenNoBlobName(): void
+    {
+        $queue = $this->createQueue('test-queue', ['usePoisonQueue' => true]);
+
+        $envelope = json_encode([
+            'messageId'    => 'msg_123',
+            'originalQueue' => 'test-queue',
+            'timestamp'    => time(),
+        ]);
+
+        $queueMessage = $this->createMockQueueMessage($envelope, 'azure-msg-id', 'pop-receipt');
+
+        $listResult = $this->createMock(ListMessagesResult::class);
+        $emptyResult = $this->createMock(ListMessagesResult::class);
+        $listResult->method('getQueueMessages')->willReturn([$queueMessage]);
+        $emptyResult->method('getQueueMessages')->willReturn([]);
+
+        $this->queueService->expects($this->exactly(2))
+            ->method('listMessages')
+            ->willReturnOnConsecutiveCalls($listResult, $emptyResult);
+
+        $this->blobService->expects($this->never())->method('deleteBlob');
+        $this->queueService->expects($this->once())->method('deleteMessage');
+
+        $count = $queue->discardAllFailed();
+
+        $this->assertSame(1, $count);
+    }
+
+    /**
+     * @test
+     */
+    public function discardAllFailedReturnsZeroWhenPoisonQueueDoesNotExist(): void
+    {
+        $queue = $this->createQueue('test-queue', ['usePoisonQueue' => true]);
+
+        $this->queueService->expects($this->once())
+            ->method('listMessages')
+            ->willThrowException(new Exception('Queue not found', 404));
+
+        $count = $queue->discardAllFailed();
+
+        $this->assertSame(0, $count);
+    }
+
+    /**
+     * @test
+     */
+    public function discardAllFailedThrowsOnUnexpectedListError(): void
+    {
+        $queue = $this->createQueue('test-queue', ['usePoisonQueue' => true]);
+
+        $this->queueService->expects($this->once())
+            ->method('listMessages')
+            ->willThrowException(new Exception('Service unavailable', 503));
+
+        $this->expectException(JobQueueException::class);
+        $this->expectExceptionCode(1234567933);
+
+        $queue->discardAllFailed();
     }
 
     /**

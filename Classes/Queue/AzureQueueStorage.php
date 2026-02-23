@@ -23,7 +23,7 @@ use Psr\Log\LoggerInterface;
  * A queue implementation using Azure Storage Queue as the queue backend
  * with claim check pattern for large messages
  */
-class AzureQueueStorage implements QueueInterface
+class AzureQueueStorage implements QueueInterface, RetryableQueueInterface
 {
     protected string $name;
 
@@ -272,15 +272,7 @@ class AzureQueueStorage implements QueueInterface
         } catch (Exception $e) {
             // Clean up blob if it was created but queue message failed
             if ($isClaimCheck && isset($blobName)) {
-                try {
-                    $this->getBlobService()->deleteBlob($this->containerName, $blobName);
-                } catch (Exception $cleanupException) {
-                    // Log cleanup failure but don't throw
-                    $this->systemLogger->error('Failed to clean up blob after message submission failure', [
-                        'blobName' => $blobName,
-                        'error' => $cleanupException->getMessage(),
-                    ]);
-                }
+                $this->deleteBlobIfPresent($blobName);
             }
             throw new JobQueueException('Failed to submit message: ' . $e->getMessage(), 1234567894);
         }
@@ -305,12 +297,8 @@ class AzureQueueStorage implements QueueInterface
             );
 
             // Clean up blob if it exists
-            if ($message->getBlobName()) {
-                try {
-                    $this->getBlobService()->deleteBlob($this->containerName, $message->getBlobName());
-                } catch (Exception $e) {
-                    $this->systemLogger->warning('Failed to delete blob after message take', ['error' => $e->getMessage()]);
-                }
+            if ($blobName = $message->getBlobName()) {
+                $this->deleteBlobIfPresent($blobName);
             }
 
             return $message;
@@ -426,14 +414,7 @@ class AzureQueueStorage implements QueueInterface
 
                 // Clean up blob if it exists
                 if (!empty($messageInfo['blobName'])) {
-                    try {
-                        $this->getBlobService()->deleteBlob($this->containerName, $messageInfo['blobName']);
-                    } catch (Exception $e) {
-                        $this->systemLogger->warning('Failed to delete blob after message abort', [
-                            'blobName' => $messageInfo['blobName'],
-                            'error'    => $e->getMessage(),
-                        ]);
-                    }
+                    $this->deleteBlobIfPresent($messageInfo['blobName']);
                 }
             }
 
@@ -472,14 +453,7 @@ class AzureQueueStorage implements QueueInterface
 
             // Clean up blob if it exists
             if (!empty($messageInfo['blobName'])) {
-                try {
-                    $this->getBlobService()->deleteBlob($this->containerName, $messageInfo['blobName']);
-                } catch (Exception $e) {
-                    $this->systemLogger->warning('Failed to delete blob after message finish', [
-                        'blobName' => $messageInfo['blobName'],
-                        'error'    => $e->getMessage(),
-                    ]);
-                }
+                $this->deleteBlobIfPresent($messageInfo['blobName']);
             }
 
             unset($this->reservedMessages[$messageId]);
@@ -637,15 +611,172 @@ class AzureQueueStorage implements QueueInterface
             $listBlobOptions->setPrefix(sprintf('queue-%s/', $this->name));
             $blobList = $this->getBlobService()->listBlobs($this->containerName, $listBlobOptions);
             foreach ($blobList->getBlobs() as $blob) {
-                try {
-                    $this->getBlobService()->deleteBlob($this->containerName, $blob->getName());
-                } catch (Exception $e) {
-                    // Continue with other blobs
-                }
+                $this->deleteBlobIfPresent($blob->getName());
             }
         } catch (Exception $e) {
             throw new JobQueueException('Failed to flush queue: ' . $e->getMessage(), 1234567902);
         }
+    }
+
+    /**
+     * @inheritdoc
+     */
+    public function peekFailed(int $limit = 1): array
+    {
+        if (!$this->usePoisonQueue) {
+            return [];
+        }
+
+        $messages = [];
+        $remaining = $limit;
+
+        // peekMessages is capped at 32 per call and has no cursor, so we can
+        // only return up to 32 distinct messages per invocation.
+        while ($remaining > 0) {
+            $batchSize = min($remaining, $this->peekLimit);
+            $options = new PeekMessagesOptions();
+            $options->setNumberOfMessages($batchSize);
+
+            try {
+                $result = $this->getQueueService()->peekMessages($this->poisonQueueName, $options);
+            } catch (Exception $e) {
+                if ($e->getCode() === 404) {
+                    break;
+                }
+                throw new JobQueueException('Failed to peek poison queue: ' . $e->getMessage(), 1234567930);
+            }
+
+            $batch = $result->getQueueMessages();
+            foreach ($batch as $queueMessage) {
+                $messages[] = $this->createMessageFromQueueMessage($queueMessage);
+            }
+
+            // Azure peek has no cursor — a second call returns the same messages
+            break;
+        }
+
+        return $messages;
+    }
+
+    /**
+     * @inheritdoc
+     */
+    public function retryAllFailed(array $options = []): int
+    {
+        if (!$this->usePoisonQueue) {
+            return 0;
+        }
+
+        $delay = (int)($options['delay'] ?? 0);
+        $limit = (int)($options['limit'] ?? 0);
+        $count = 0;
+
+        while (true) {
+            if ($limit > 0 && $count >= $limit) {
+                break;
+            }
+
+            $listOptions = new ListMessagesOptions();
+            $listOptions->setNumberOfMessages(1);
+            $listOptions->setVisibilityTimeoutInSeconds($this->visibilityTimeout);
+
+            try {
+                $result = $this->getQueueService()->listMessages($this->poisonQueueName, $listOptions);
+            } catch (Exception $e) {
+                if ($e->getCode() === 404) {
+                    break;
+                }
+                throw new JobQueueException('Failed to list poison queue: ' . $e->getMessage(), 1234567931);
+            }
+
+            $queueMessages = $result->getQueueMessages();
+            if (empty($queueMessages)) {
+                break;
+            }
+
+            $message = $this->createMessageFromQueueMessage($queueMessages[0], $queueMessages[0]->getPopReceipt());
+
+            try {
+                $this->requeuePoisonMessage($message, $delay);
+                $this->getQueueService()->deleteMessage(
+                    $this->poisonQueueName,
+                    $message->getQueueMessageId(),
+                    $message->getPopReceipt()
+                );
+                $count++;
+            } catch (Exception $e) {
+                // Release the message back to the poison queue so it isn't silently lost
+                try {
+                    $this->getQueueService()->updateMessage(
+                        $this->poisonQueueName,
+                        $message->getQueueMessageId(),
+                        $message->getPopReceipt(),
+                        '',
+                        0
+                    );
+                } catch (Exception $releaseEx) {
+                    $this->systemLogger->error('Failed to release poison message after retry error', [
+                        'messageId' => $message->getIdentifier(),
+                        'error' => $releaseEx->getMessage(),
+                    ]);
+                }
+                throw new JobQueueException(
+                    'Failed to retry poison message ' . $message->getIdentifier() . ': ' . $e->getMessage(),
+                    1234567932
+                );
+            }
+        }
+
+        return $count;
+    }
+
+    /**
+     * @inheritdoc
+     */
+    public function discardAllFailed(array $options = []): int
+    {
+        if (!$this->usePoisonQueue) {
+            return 0;
+        }
+
+        $limit = (int)($options['limit'] ?? 0);
+        $count = 0;
+
+        while (true) {
+            if ($limit > 0 && $count >= $limit) {
+                break;
+            }
+
+            $listOptions = new ListMessagesOptions();
+            $listOptions->setNumberOfMessages(1);
+            $listOptions->setVisibilityTimeoutInSeconds($this->visibilityTimeout);
+
+            try {
+                $result = $this->getQueueService()->listMessages($this->poisonQueueName, $listOptions);
+            } catch (Exception $e) {
+                if ($e->getCode() === 404) {
+                    break;
+                }
+                throw new JobQueueException('Failed to list poison queue: ' . $e->getMessage(), 1234567933);
+            }
+
+            $queueMessages = $result->getQueueMessages();
+            if (empty($queueMessages)) {
+                break;
+            }
+
+            $queueMessage = $queueMessages[0];
+            $this->deleteBlobIfPresent($this->extractBlobName($queueMessage->getMessageText()));
+            $this->getQueueService()->deleteMessage(
+                $this->poisonQueueName,
+                $queueMessage->getMessageId(),
+                $queueMessage->getPopReceipt()
+            );
+
+            $count++;
+        }
+
+        return $count;
     }
 
     protected function getQueueService(): IQueue
@@ -896,16 +1027,100 @@ class AzureQueueStorage implements QueueInterface
     /**
      * @throws JobQueueException
      */
-    protected function createMessageFromQueueMessage(QueueMessage $queueMessage): AzureQueueStorageMessage
-    {
-        $payload = $this->extractPayload($queueMessage->getMessageText());
+    protected function createMessageFromQueueMessage(
+        QueueMessage $queueMessage,
+        ?string $popReceipt = null,
+        ?string $queueName = null
+    ): AzureQueueStorageMessage {
+        // For poison queue messages we want the raw envelope as the payload,
+        $data = json_decode($queueMessage->getMessageText(), true);
+        $isPoisonEnvelope = is_array($data) && isset($data['originalQueue']);
+
+        if ($isPoisonEnvelope) {
+            // Resolve claim-check blob into the envelope if present
+            if (!empty($data['isClaimCheck']) && !empty($data['blobName'])) {
+                try {
+                    $blobResult = $this->getBlobService()->getBlob($this->containerName, $data['blobName']);
+                    $data['payload'] = json_decode(stream_get_contents($blobResult->getContentStream()), true);
+                    unset($data['isClaimCheck']); // normalise
+                } catch (Exception $e) {
+                    throw new JobQueueException(
+                        'Failed to read claim-check blob for poison message: ' . $e->getMessage(),
+                        1234567936
+                    );
+                }
+            }
+            $payload = $data; // return the full envelope
+        } else {
+            $payload = $this->extractPayload($queueMessage->getMessageText());
+        }
+
         return new AzureQueueStorageMessage(
             $this->extractMessageId($queueMessage->getMessageText()),
             $payload,
-            0, // numberOfReleases not available in peek
+            0,
             $queueMessage->getMessageId(),
-            null, // No pop receipt in peek
-            $this->extractBlobName($queueMessage->getMessageText())
+            $popReceipt,
+            $isPoisonEnvelope ? null : $this->extractBlobName($queueMessage->getMessageText()),
+            $queueName
         );
+    }
+
+    /**
+     * Resubmit a poison message back to its original queue.
+     *
+     * The original queue is read from the poison envelope stored in the
+     * message payload: ['originalQueue' => '...', 'payload' => ...].
+     *
+     * When preservePoisonPayload was false the envelope has no 'payload' key
+     * and the requeued message will carry a null payload.
+     */
+    private function requeuePoisonMessage(AzureQueueStorageMessage $message, int $delay = 0): void
+    {
+        $envelope = $message->getPayload();
+        $targetQueue = $envelope['originalQueue'] ?? $this->normalPriorityQueueName;
+        $payload = array_key_exists('payload', $envelope) ? $envelope['payload'] : null;
+
+        $messageContent = json_encode([
+            'messageId' => $message->getIdentifier(),
+            'payload' => $payload,
+        ]);
+
+        if (strlen($messageContent) > $this->claimCheckThreshold) {
+            $newBlobName = $this->generateBlobName($message->getIdentifier());
+            $this->getBlobService()->createBlockBlob($this->containerName, $newBlobName, json_encode($payload));
+            $messageContent = json_encode([
+                'isClaimCheck' => true,
+                'blobName' => $newBlobName,
+                'originalSize' => strlen(json_encode($payload)),
+                'messageId' => $message->getIdentifier(),
+            ]);
+        }
+
+        $createOptions = new CreateMessageOptions();
+        $createOptions->setTimeToLiveInSeconds($this->defaultTtl);
+        if ($delay > 0) {
+            $createOptions->setVisibilityTimeoutInSeconds($delay);
+        }
+
+        $this->getQueueService()->createMessage($targetQueue, $messageContent, $createOptions);
+    }
+
+    /**
+     * Delete a blob, swallowing and logging any errors.
+     */
+    private function deleteBlobIfPresent(?string $blobName): void
+    {
+        if ($blobName === null) {
+            return;
+        }
+        try {
+            $this->getBlobService()->deleteBlob($this->containerName, $blobName);
+        } catch (Exception $e) {
+            $this->systemLogger->warning('Failed to delete blob', [
+                'blobName' => $blobName,
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 }
