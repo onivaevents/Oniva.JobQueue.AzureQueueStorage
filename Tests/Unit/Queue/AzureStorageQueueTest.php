@@ -578,6 +578,31 @@ class AzureStorageQueueTest extends UnitTestCase
     /**
      * @test
      */
+    public function releaseHandles404Gracefully(): void
+    {
+        $queue = $this->createQueue();
+        $this->setupReservedMessage($queue, 'msg_123');
+
+        $this->queueService->expects($this->once())
+            ->method('updateMessage')
+            ->willThrowException(new Exception('Not found', 404));
+
+        $this->logger->expects($this->once())
+            ->method('warning')
+            ->with(
+                'Message no longer available during release(), likely taken by another worker',
+                ['messageId' => 'msg_123']
+            );
+
+        // Should not throw
+        $queue->release('msg_123');
+
+        $this->assertEquals(0, $queue->countReserved());
+    }
+
+    /**
+     * @test
+     */
     public function abortDeletesMessageAndBlob(): void
     {
         $queue = $this->createQueue();
@@ -628,6 +653,136 @@ class AzureStorageQueueTest extends UnitTestCase
         $queue->abort('msg_123');
     }
 
+
+    /**
+     * @test
+     */
+    public function abortOnPoisonQueueSkipsDeleteAndRepoison(): void
+    {
+        $queue = $this->createQueue('test-queue', ['usePoisonQueue' => true]);
+
+        // Manually set up a reserved message that came from the poison queue
+        $reflection = new ReflectionClass($queue);
+        $property = $reflection->getProperty('reservedMessages');
+        $property->setAccessible(true);
+        $property->setValue($queue, [
+            'msg_123' => [
+                'queueMessageId' => 'azure-msg-id',
+                'popReceipt'     => 'pop-receipt',
+                'blobName'       => null,
+                'queueName'      => 'test-queue-poison',
+                'payload'        => ['test' => 'data'],
+            ],
+        ]);
+
+        // Neither createMessage nor deleteMessage should be called
+        $this->queueService->expects($this->never())->method('createMessage');
+        $this->queueService->expects($this->never())->method('deleteMessage');
+
+        $queue->abort('msg_123');
+
+        // Message should still be untracked locally after abort
+        $this->assertEquals(0, $queue->countReserved());
+    }
+
+    /**
+     * @test
+     */
+    public function abortHandles404Gracefully(): void
+    {
+        $queue = $this->createQueue();
+        $this->setupReservedMessage($queue, 'msg_123');
+
+        $this->queueService->expects($this->once())
+            ->method('deleteMessage')
+            ->willThrowException(new Exception('Not found', 404));
+
+        $this->logger->expects($this->once())
+            ->method('warning')
+            ->with(
+                'Message no longer available during abort(), likely taken by another worker',
+                ['messageId' => 'msg_123']
+            );
+
+        $queue->abort('msg_123');
+
+        $this->assertEquals(0, $queue->countReserved());
+    }
+
+    /**
+     * @test
+     */
+    public function abortPreservesPoisonPayloadInline(): void
+    {
+        $queue = $this->createQueue('test-queue', [
+            'usePoisonQueue'       => true,
+            'preservePoisonPayload' => true,
+        ]);
+
+        $this->setupReservedMessage($queue, 'msg_123');
+
+        // Manually inject payload into reserved message
+        $reflection = new ReflectionClass($queue);
+        $property = $reflection->getProperty('reservedMessages');
+        $property->setAccessible(true);
+        $messages = $property->getValue($queue);
+        $messages['msg_123']['payload'] = ['important' => 'data'];
+        $property->setValue($queue, $messages);
+
+        $this->queueService->expects($this->once())
+            ->method('createMessage')
+            ->with(
+                'test-queue-poison',
+                $this->callback(function ($envelope) {
+                    $data = json_decode($envelope, true);
+                    return isset($data['payload']) && $data['payload'] === ['important' => 'data'];
+                })
+            );
+
+        $this->queueService->method('deleteMessage');
+
+        $queue->abort('msg_123');
+    }
+
+    /**
+     * @test
+     */
+    public function abortPreservesPoisonPayloadViaClaimCheckForLargePayload(): void
+    {
+        $queue = $this->createQueue('test-queue', [
+            'usePoisonQueue'        => true,
+            'preservePoisonPayload' => true,
+            'claimCheckThreshold'   => 100,
+        ]);
+
+        $this->setupReservedMessage($queue, 'msg_123');
+
+        $reflection = new ReflectionClass($queue);
+        $property = $reflection->getProperty('reservedMessages');
+        $property->setAccessible(true);
+        $messages = $property->getValue($queue);
+        $messages['msg_123']['payload'] = ['data' => str_repeat('x', 200)];
+        $property->setValue($queue, $messages);
+
+        $this->blobService->expects($this->once())
+            ->method('createBlockBlob')
+            ->with('jobqueue-blobs', $this->stringContains('poison-msg_123'));
+
+        $this->queueService->expects($this->once())
+            ->method('createMessage')
+            ->with(
+                'test-queue-poison',
+                $this->callback(function ($envelope) {
+                    $data = json_decode($envelope, true);
+                    return ($data['isClaimCheck'] ?? false) === true && isset($data['blobName']);
+                })
+            );
+
+        $this->queueService->method('deleteMessage');
+
+        $queue->abort('msg_123');
+    }
+
     /**
      * @test
      */
@@ -660,6 +815,28 @@ class AzureStorageQueueTest extends UnitTestCase
         $result = $queue->finish('unknown-message');
 
         $this->assertFalse($result);
+    }
+
+    /**
+     * @test
+     */
+    public function finishReturnsTrueWhenMessageAlreadyDeletedByAnotherWorker(): void
+    {
+        $queue = $this->createQueue();
+        $this->setupReservedMessage($queue, 'msg_123');
+
+        $this->queueService->expects($this->once())
+            ->method('deleteMessage')
+            ->willThrowException(new Exception('Not found', 404));
+
+        $this->logger->expects($this->once())
+            ->method('info')
+            ->with('Message already deleted by another worker during finish', ['messageId' => 'msg_123']);
+
+        $result = $queue->finish('msg_123');
+
+        $this->assertTrue($result);
+        $this->assertEquals(0, $queue->countReserved());
     }
 
     /**
@@ -932,19 +1109,6 @@ class AzureStorageQueueTest extends UnitTestCase
         $this->assertEquals(['priority' => 'high'], $message->getPayload());
     }
 
-    /**
-     * Helper method to create a mock queue message
-     */
-    protected function createMockQueueMessage(string $messageText, string $messageId, string $popReceipt): QueueMessage&MockObject
-    {
-        $queueMessage = $this->createMock(QueueMessage::class);
-        $queueMessage->method('getMessageText')->willReturn($messageText);
-        $queueMessage->method('getMessageId')->willReturn($messageId);
-        $queueMessage->method('getPopReceipt')->willReturn($popReceipt);
-        $queueMessage->method('getDequeueCount')->willReturn(1);
-
-        return $queueMessage;
-    }
 
     /**
      * @test
@@ -970,6 +1134,20 @@ class AzureStorageQueueTest extends UnitTestCase
     }
 
     /**
+     * Helper method to create a mock queue message
+     */
+    protected function createMockQueueMessage(string $messageText, string $messageId, string $popReceipt): QueueMessage&MockObject
+    {
+        $queueMessage = $this->createMock(QueueMessage::class);
+        $queueMessage->method('getMessageText')->willReturn($messageText);
+        $queueMessage->method('getMessageId')->willReturn($messageId);
+        $queueMessage->method('getPopReceipt')->willReturn($popReceipt);
+        $queueMessage->method('getDequeueCount')->willReturn(1);
+
+        return $queueMessage;
+    }
+
+    /**
      * Helper method to setup a reserved message in the queue's internal tracking
      */
     protected function setupReservedMessage(AzureQueueStorage $queue, string $messageId, ?string $blobName = null): void
@@ -980,6 +1158,7 @@ class AzureStorageQueueTest extends UnitTestCase
                 'popReceipt' => 'pop-receipt',
                 'blobName' => $blobName,
                 'queueName' => 'test-queue',
+                'payload' => ['test' => 'data'],
             ],
         ];
 
