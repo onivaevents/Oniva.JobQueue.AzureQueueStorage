@@ -127,6 +127,7 @@ class AzureQueueStorage implements QueueInterface
 
         // Store other configuration
         $this->defaultTimeout = (int)($options['defaultTimeout'] ?? 30);
+        $this->visibilityTimeout = (int)($options['visibilityTimeout'] ?? 300);
         $this->claimCheckThreshold = (int)($options['claimCheckThreshold'] ?? 32768);
         $this->defaultTtl = (int)($options['defaultTtl'] ?? 604800);
         $this->pollingInterval = (int)($options['pollingInterval'] ?? 1000);
@@ -625,6 +626,14 @@ class AzureQueueStorage implements QueueInterface
             throw new JobQueueException('Azure Storage connection string is required', 1234567890);
         }
 
+        $visibilityTimeout = (int)($options['visibilityTimeout'] ?? 300);
+        if ($visibilityTimeout < 1 || $visibilityTimeout > 604800) {
+            throw new JobQueueException(
+                'visibilityTimeout must be between 1 and 604800 seconds.',
+                1234567926
+            );
+        }
+
         if (isset($options['usePriorityQueue']) && $options['usePriorityQueue']) {
             $suffix = $options['prioritySuffix'] ?? $this->prioritySuffix;
             $maxBaseNameLength = 63 - strlen($suffix);
@@ -676,14 +685,16 @@ class AzureQueueStorage implements QueueInterface
 
         $startTime = microtime(true);
 
-        while ((microtime(true) - $startTime) < $timeout) {
+        do {
             $message = $this->tryReceiveOnce();
             if ($message !== null) {
                 return $message;
             }
 
-            usleep($this->pollingInterval * 1000);
-        }
+            if ((microtime(true) - $startTime) < $timeout) {
+                usleep($this->pollingInterval * 1000);
+            }
+        } while ((microtime(true) - $startTime) < $timeout);
 
         return null;
     }
