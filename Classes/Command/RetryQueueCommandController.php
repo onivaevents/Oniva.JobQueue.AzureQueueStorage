@@ -5,6 +5,7 @@ namespace Oniva\JobQueue\AzureQueueStorage\Command;
 use Neos\Flow\Annotations as Flow;
 use Flowpack\JobQueue\Common\Queue\QueueManager;
 use Neos\Flow\Cli\CommandController;
+use Oniva\JobQueue\AzureQueueStorage\Queue\AzureQueueStorageMessage;
 use Oniva\JobQueue\AzureQueueStorage\Queue\RetryableQueueInterface;
 use Exception;
 
@@ -48,10 +49,11 @@ class RetryQueueCommandController extends CommandController
      *
      * @param string $queue Name of the base queue
      * @param int $delay Optional delay in seconds before the retried messages become available again
+     * @param int $limit Optional limit for the number of messages to retry, if 0 all messages will be retried
      * @return void
      * @throws \Flowpack\JobQueue\Common\Exception
      */
-    public function retryAllCommand(string $queue, int $delay = 0): void
+    public function retryAllCommand(string $queue, int $delay = 0, int $limit = 0): void
     {
         $queueInstance = $this->getQueue($queue);
 
@@ -60,7 +62,7 @@ class RetryQueueCommandController extends CommandController
             return;
         }
 
-        $count = $queueInstance->retryAllFailed(['delay' => $delay]);
+        $count = $queueInstance->retryAllFailed(['delay' => $delay, 'limit' => $limit]);
         $this->outputLine('Retried <success>%d</success> messages from poison queue', [$count]);
     }
 
@@ -68,8 +70,11 @@ class RetryQueueCommandController extends CommandController
      * Discard all messages from the poison queue
      *
      * @param string $queue Name of the base queue
+     * @param int $limit Optional limit for the number of messages to discard, if 0 all messages will be discarded
+      * @return void
+      * @throws \Flowpack\JobQueue\Common\Exception
      */
-    public function discardAllCommand(string $queue): void
+    public function discardAllCommand(string $queue, int $limit = 0): void
     {
         $queueInstance = $this->getQueue($queue);
 
@@ -78,7 +83,7 @@ class RetryQueueCommandController extends CommandController
             return;
         }
 
-        $count = $queueInstance->discardAllFailed();
+        $count = $queueInstance->discardAllFailed(['limit' => $limit]);
         $this->outputLine('Discarded <success>%d</success> messages from poison queue', [$count]);
     }
 
@@ -106,7 +111,11 @@ class RetryQueueCommandController extends CommandController
             if (strlen($payloadPreview) > 100) {
                 $payloadPreview = substr($payloadPreview, 0, $previewLength);
             }
-            $rows[] = [$message->getIdentifier(), $message->getQueueMessageId(), $message->getBlobName(), $message->getNumberOfReleases(), $payloadPreview];
+            $messageId = $message->getIdentifier();
+            $queueMessageId = $message instanceof AzureQueueStorageMessage ? $message->getQueueMessageId() : '-';
+            $blobName = $message instanceof AzureQueueStorageMessage ? $message->getBlobName() : '-';
+            $numberOfReleases = $message->getNumberOfReleases();
+            $rows[] = [$messageId, $queueMessageId, $blobName, $numberOfReleases, $payloadPreview];
         }
         $this->output->outputTable($rows, ['Message ID', 'Queue Message ID', 'Blob Name', 'Releases', 'Payload']);
     }

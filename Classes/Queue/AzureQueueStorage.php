@@ -668,9 +668,14 @@ class AzureQueueStorage implements QueueInterface, RetryableQueueInterface
         }
 
         $delay = (int)($options['delay'] ?? 0);
+        $limit = (int)($options['limit'] ?? 0);
         $count = 0;
 
         while (true) {
+            if ($limit > 0 && $count >= $limit) {
+                break;
+            }
+
             $listOptions = new ListMessagesOptions();
             $listOptions->setNumberOfMessages(1);
             $listOptions->setVisibilityTimeoutInSeconds($this->visibilityTimeout);
@@ -724,18 +729,24 @@ class AzureQueueStorage implements QueueInterface, RetryableQueueInterface
 
         return $count;
     }
+
     /**
      * @inheritdoc
      */
-    public function discardAllFailed(): int
+    public function discardAllFailed(array $options = []): int
     {
         if (!$this->usePoisonQueue) {
             return 0;
         }
 
+        $limit = (int)($options['limit'] ?? 0);
         $count = 0;
 
         while (true) {
+            if ($limit > 0 && $count >= $limit) {
+                break;
+            }
+
             $listOptions = new ListMessagesOptions();
             $listOptions->setNumberOfMessages(1);
             $listOptions->setVisibilityTimeoutInSeconds($this->visibilityTimeout);
