@@ -87,8 +87,9 @@ class RetryQueueCommandController extends CommandController
      *
      * @param string $queue Name of the base queue
      * @param int $limit Number of messages to peek at
+     * @param int $previewLength Maximum length of the payload preview
      */
-    public function peekCommand(string $queue, int $limit = 5): void
+    public function peekCommand(string $queue, int $limit = 5, int $previewLength = 100): void
     {
         $queueInstance = $this->getQueue($queue);
         $messages = $queueInstance->peekFailed($limit);
@@ -100,9 +101,14 @@ class RetryQueueCommandController extends CommandController
 
         $rows = [];
         foreach ($messages as $message) {
-            $rows[] = [$message->getIdentifier(), json_encode($message->getPayload())];
+            $payload = $message->getPayload();
+            $payloadPreview = json_encode($payload);
+            if (strlen($payloadPreview) > 100) {
+                $payloadPreview = substr($payloadPreview, 0, $previewLength);
+            }
+            $rows[] = [$message->getIdentifier(), $message->getQueueMessageId(), $message->getBlobName(), $message->getNumberOfReleases(), $payloadPreview];
         }
-        $this->output->outputTable($rows, ['Message ID', 'Payload']);
+        $this->output->outputTable($rows, ['Message ID', 'Queue Message ID', 'Blob Name', 'Releases', 'Payload']);
     }
 
     private function getQueue(string $queue): RetryableQueueInterface
