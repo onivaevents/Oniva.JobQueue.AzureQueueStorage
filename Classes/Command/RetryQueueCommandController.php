@@ -19,6 +19,12 @@ class RetryQueueCommandController extends CommandController
      */
     protected $queueManager;
 
+    /**
+     * Show message counts for a queue including reserved and failed messages
+     *
+     * @param string $queue Name of the base queue
+     * @return void
+     */
     public function statusCommand(string $queue): void
     {
         $queueInstance = $this->getQueue($queue);
@@ -37,6 +43,14 @@ class RetryQueueCommandController extends CommandController
         $this->output->outputTable($rows, ['Queue', '# ready', '# reserved', '# failed']);
     }
 
+    /**
+     * Retry all messages from the poison queue
+     *
+     * @param string $queue Name of the base queue
+     * @param int $delay Optional delay in seconds before the retried messages become available again
+     * @return void
+     * @throws \Flowpack\JobQueue\Common\Exception
+     */
     public function retryAllCommand(string $queue, int $delay = 0): void
     {
         $queueInstance = $this->getQueue($queue);
@@ -69,7 +83,7 @@ class RetryQueueCommandController extends CommandController
     }
 
     /**
-     * Show up to $limit messages from the poison queue without consuming them
+     * Peek messages from the poison queue without modifying them
      *
      * @param string $queue Name of the base queue
      * @param int $limit Number of messages to peek at
