@@ -41,7 +41,15 @@ class AzureQueueStorage implements QueueInterface
 
     protected string $containerName;
 
+    /**
+     * Polling timeout (how long to wait for a message)
+     */
     protected int $defaultTimeout = 30;
+
+    /**
+     * Visibility timeout (how long message stays hidden during processing)
+     */
+    protected int $visibilityTimeout = 300;
 
     /**
      * Message size threshold for claim check pattern (in bytes)
@@ -685,6 +693,7 @@ class AzureQueueStorage implements QueueInterface
         try {
             $listMessagesOptions = new ListMessagesOptions();
             $listMessagesOptions->setNumberOfMessages(1);
+            $listMessagesOptions->setVisibilityTimeoutInSeconds($this->visibilityTimeout);
 
             /**
              * @var QueueMessage[] $queueMessages
